@@ -643,7 +643,7 @@ def _trace_tags(platform: str) -> list[str]:
 
 def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform: str, provider: str, model: str,
                       api_mode: str, messages: Any, client: Langfuse,
-                      turn_id: str = "", api_request_id: str = "") -> TraceState:
+                      turn_id: str = "", api_request_id: str = "", user_id: str = "") -> TraceState:
     # Session IDs deliberately group Langfuse traces, but cannot also identify
     # a trace: gateway and hosted-room turns retain one session across many
     # replies.  Prefer the unique turn ID (then request ID for hook callers
@@ -665,8 +665,11 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         "platform": platform, "provider": provider, "model": model, "api_mode": api_mode,
         "capture_mode": _capture_mode(), "profile": profile, **kanban,
     }
-    # session_id must be in trace_context for Langfuse session grouping.
-    trace_ctx: dict[str, Any] = {"trace_id": trace_id, **({"session_id": session_id} if session_id else {})}
+    # session_id / user_id must be in trace_context for Langfuse session / user grouping. user_id is the
+    # end user a frontend proxying many people through one deployment declared for the turn; absent
+    # (not "") when unknown, since an empty Langfuse user_id is still a value.
+    trace_ctx: dict[str, Any] = {"trace_id": trace_id, **({"session_id": session_id} if session_id else {}),
+                                 **({"user_id": user_id} if user_id else {})}
 
     # Detached start_observation(), not start_as_current_observation(): the "current" variant pushes an OTEL
     # contextvars token that must be popped in the same context it was pushed in, but the root span is ended by
@@ -678,6 +681,8 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
 
     root_span = None
     propagated = {"session_id": session_id or task_key, "trace_name": "Hermes turn", "tags": _trace_tags(platform)}
+    if user_id:
+        propagated["user_id"] = user_id
     if profile or kanban:
         propagated["metadata"] = {**({"profile": profile} if profile else {}), **kanban}
     if propagate_attributes is not None:
@@ -844,7 +849,7 @@ def _get_or_start_state_locked(task_key: str, **root_kwargs: Any) -> TraceState:
 
 def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = "", model: str = "",
                     provider: str = "", api_mode: str = "", messages: Any = None,
-                    turn_id: str = "", api_request_id: str = "", **_: Any) -> None:
+                    turn_id: str = "", api_request_id: str = "", user_id: str = "", **_: Any) -> None:
     # Only legacy request-shaped calls carry an API ``messages`` list; the
     # turn-scoped pre_llm_call would otherwise open an orphan root trace.
     if not isinstance(messages, list):
@@ -854,7 +859,8 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
         return
     with _STATE_LOCK:
         _get_or_start_state_locked(task_key, task_id=task_id, session_id=session_id, platform=platform, provider=provider, model=model,
-                                   api_mode=api_mode, messages=messages, client=client, turn_id=turn_id, api_request_id=api_request_id)
+                                   api_mode=api_mode, messages=messages, client=client, turn_id=turn_id, api_request_id=api_request_id,
+                                   user_id=user_id)
 
 
 def _emit_moa_reference_generations(state: TraceState, *, client: Langfuse, references: Any) -> None:
@@ -896,7 +902,7 @@ def on_pre_llm_request(*, task_id: str = "", session_id: str = "", platform: str
                        request_messages: Any = None, messages: Any = None, message_count: int = 0,
                        approx_input_tokens: int = 0, conversation_history: Any = None,
                        user_message: Any = None, turn_id: str = "", api_request_id: str = "",
-                       request: Any = None, system_prompt: Any = None, **_: Any) -> None:
+                       request: Any = None, system_prompt: Any = None, user_id: str = "", **_: Any) -> None:
     client, task_key = _client_and_key(task_id, session_id, turn_id, api_request_id)
     if client is None:
         return
@@ -920,7 +926,8 @@ def on_pre_llm_request(*, task_id: str = "", session_id: str = "", platform: str
     with _STATE_LOCK:
         state = _get_or_start_state_locked(
             task_key, task_id=task_id, session_id=session_id, platform=platform, provider=provider, model=model,
-            api_mode=api_mode, messages=input_messages, client=client, turn_id=turn_id, api_request_id=api_request_id)
+            api_mode=api_mode, messages=input_messages, client=client, turn_id=turn_id, api_request_id=api_request_id,
+            user_id=user_id)
         previous = state.generations.pop(req_key, None)
         if previous is not None:
             _end_observation(previous, level="WARNING",
